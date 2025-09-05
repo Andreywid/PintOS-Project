@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "synch.h"
 #define PRI_MAX 63               
 
 /* States in a thread's life cycle. */
@@ -109,6 +110,15 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    int exit_status;
+    struct list_elem child_elem;
+    struct list child_list;
+    // semáforos
+    struct semaphore load_lock;
+    struct semaphore mem_lock;
+    struct semaphore child_lock;
+    // Vetor de descritores de arquivos
+    struct file* FD[128];
 #endif
 
     /* Owned by thread.c. */

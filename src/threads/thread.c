@@ -305,18 +305,27 @@ thread_exit (void)
 /* Yields the CPU.  The current thread is not put to sleep and
    may be scheduled again immediately at the scheduler's whim. */
 void
-thread_yield (void) 
+thread_yield (void)
 {
   struct thread *cur = thread_current ();
   enum intr_level old_level;
   
+  #ifdef USERPROG
+    if (intr_context ())
+      return;
+  #endif
+
   ASSERT (!intr_context ());
 
   old_level = intr_disable ();
-  if (cur != idle_thread){
-    //list_push_back (&ready_list, &cur->elem);
-    list_insert_ordered (&ready_list, &cur->elem, CompPR, 0); //modificando a função para inserir na ordem de prioridade
-  }
+  if (cur != idle_thread)
+    {
+      #ifndef USERPROG
+        list_insert_ordered (&ready_list, &cur->elem, CompPR, 0);
+      #else
+        list_push_back (&ready_list, &cur->elem);
+      #endif
+    }
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -508,6 +517,21 @@ init_thread (struct thread *t, const char *name, int priority)
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
+
+  #ifdef USERPROG
+    // Inicializa o vetor de descritores de arquivos
+    // Cada thread (processo) tem 128 descritores  
+    for(int i = 0; i < 128; i++){
+      t->FD[i] = NULL;
+    }
+    // Inicializa semáforos usados para sincronização entre processos e threads
+    sema_init(&(t->load_lock), 0);
+    sema_init(&(t->child_lock), 0);
+    sema_init(&(t->mem_lock), 0);
+
+    list_init(&t->child_list);
+    list_push_back(&(running_thread()->child_list), &(t->child_elem));
+  #endif
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -612,7 +636,7 @@ allocate_tid (void)
 {
   static tid_t next_tid = 1;
   tid_t tid;
-
+ 
   lock_acquire (&tid_lock);
   tid = next_tid++;
   lock_release (&tid_lock);

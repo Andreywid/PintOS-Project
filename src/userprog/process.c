@@ -17,9 +17,11 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "userprog/syscall.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+void setup_user_stack_args(char *argv[], void **esp, int argc);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -38,10 +40,48 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  // Extrair o nome do comando (até o primeiro espaço)
+  char str_cmd[128];
+  strlcpy(str_cmd, file_name, 1 + strlen(file_name));
+
+  for (int i = 0; i < (int)strlen(str_cmd); i++) {
+    if(str_cmd[i] == ' '){
+      str_cmd[i] = '\0';
+      break;
+    }
+  }
+  if(filesys_open(str_cmd) == NULL){
+    return TID_ERROR;
+  }
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
+  tid = thread_create (str_cmd, PRI_DEFAULT, start_process, fn_copy);
+
+  struct thread* child = NULL;
+
+  struct thread* t;
+  struct list_elem *elem;
+  // Espera o carregamento do processo filho
+  for (elem = list_begin(&thread_current()->child_list);
+       elem != list_end(&thread_current()->child_list);
+       elem = list_next(elem)) {
+
+    t = list_entry(elem, struct thread, child_elem);
+
+    if (t->tid == tid) {
+      child = t;
+      break;
+    }
+  }
+
+  sema_down(&child->load_lock);
+
+  if (tid == TID_ERROR){
     palloc_free_page (fn_copy); 
+  }
+  
+  if(child->exit_status == -1){
+    return process_wait(tid);
+  }
   return tid;
 }
 
@@ -63,9 +103,10 @@ start_process (void *file_name_)
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
-
+  sema_up(&thread_current()->load_lock);
+  if (!success){
+    EXIT(-1);
+  }
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
      threads/intr-stubs.S).  Because intr_exit takes all of its
@@ -88,7 +129,33 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
-  return -1;
+  //Implementação do process_wait onde espera o filho terminar
+  // e retorna seu exit_status, ou -1 se inválido
+  struct thread *cur = thread_current();
+  struct thread *child = NULL;
+  int exit_status = -1;
+    
+  struct list_elem *elem;
+  // Procura o filho com o tid especificado
+  for (elem = list_begin(&cur->child_list);
+       elem != list_end(&cur->child_list);
+       elem = list_next(elem)) {
+
+    child = list_entry(elem, struct thread, child_elem);
+    if (child->tid == child_tid) {
+      // Espera o filho terminar
+      sema_down(&(child->child_lock));
+      // Pega o exit_status do filho
+      exit_status = child->exit_status;
+      // Remove o filho da lista de filhos
+      list_remove(&(child->child_elem));
+      // Libera o lock de memória do filho
+      sema_up(&(child->mem_lock));
+      break;
+    }
+
+  }
+  return exit_status;
 }
 
 /* Free the current process's resources. */
@@ -114,6 +181,14 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+    for (int i = 2; i < 128; i++) {
+      if (cur->FD[i] != NULL){
+        file_close(cur->FD[i]);
+      } 
+    }
+
+    sema_up(&(cur->child_lock));
+    sema_down(&(cur->mem_lock));
 }
 
 /* Sets up the CPU for running user code in the current
@@ -221,11 +296,24 @@ load (const char *file_name, void (**eip) (void), void **esp)
     goto done;
   process_activate ();
 
+  int argc = 0;
+	char* argv[128];
+	char cmdline_copy[128];
+	char *save_ptr;
+
+	snprintf(cmdline_copy, sizeof(cmdline_copy), "%s", file_name);
+  for (char* token = strtok_r(cmdline_copy, " ", &save_ptr);
+       token != NULL;
+       token = strtok_r(NULL, " ", &save_ptr)) {
+    argv[argc++] = token;
+  }
+
+  char* program_name = argv[0];
   /* Open executable file. */
-  file = filesys_open (file_name);
+  file = filesys_open (program_name);
   if (file == NULL) 
     {
-      printf ("load: %s: open failed\n", file_name);
+      printf ("load: %s: open failed\n", program_name);
       goto done; 
     }
 
@@ -304,6 +392,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* Set up stack. */
   if (!setup_stack (esp))
     goto done;
+  setup_user_stack_args(argv, esp, argc);
 
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
@@ -462,4 +551,45 @@ install_page (void *upage, void *kpage, bool writable)
      address, then map our page there. */
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
+}
+
+// Monta a pilha do processo com os argumentos
+void setup_user_stack_args(char* argv[], void **esp, int argc) {
+  int argv_addrs[128];
+  int pad = 0;
+
+  // Copia as strings para a pilha
+  for (int i = argc - 1; i >= 0; i--) {
+    int arg_len = (int)strlen(argv[i]) + 1;
+    *esp -= arg_len;
+    memcpy(*esp, argv[i], arg_len);
+    pad += arg_len;
+    argv_addrs[i] = (int)*esp;
+  }
+
+  // colocando para 4 bytes
+  pad = (pad % 4 == 0) ? 0 : (4 - (pad % 4));
+  *esp -= pad;
+  memset(*esp, 0, pad);
+
+  *esp -= sizeof(uint32_t);
+  memset(*esp, 0, sizeof(uint32_t));
+
+  // Empilha os ponteiros argv[i] na pilha
+  for (int i = argc - 1; i >= 0; i--) {
+    *esp -= sizeof(uint32_t);
+    memcpy(*esp, &argv_addrs[i], sizeof(uint32_t));
+  }
+  // Empilha o ponteiro argv
+  int argv_ptr = (int)*esp;
+  *esp -= sizeof(uint32_t);
+  memcpy(*esp, &argv_ptr, sizeof(uint32_t));
+
+  // Empilha argc
+  *esp -= sizeof(uint32_t);
+  memcpy(*esp, &argc, sizeof(uint32_t));
+
+  // Endereço de retorno “fake”
+  *esp -= sizeof(uint32_t);
+  memset(*esp, 0, sizeof(uint32_t));
 }
