@@ -7,6 +7,7 @@
 #include "synch.h"
 #define PRI_MAX 63               
 
+#include "lib/kernel/hash.h"
 /* States in a thread's life cycle. */
 enum thread_status
   {
@@ -110,6 +111,7 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    struct thread *parent;              /* parent thread */
     int exit_status;
     struct list_elem child_elem;
     struct list child_list;
@@ -119,6 +121,9 @@ struct thread
     struct semaphore child_lock;
     // Vetor de descritores de arquivos
     struct file* FD[128];
+    struct hash vm;
+    struct list mmap_list;
+    int next_mapid;
 #endif
 
     /* Owned by thread.c. */

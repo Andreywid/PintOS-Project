@@ -5,7 +5,10 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "vm/page.h"
+#include "vm/swap.h"
 
+static bool stack_growth_allowed (void *addr, void *esp);
 /* Number of page faults processed. */
 static long long page_fault_cnt;
 
@@ -146,25 +149,57 @@ page_fault (struct intr_frame *f)
 
   /* Determine cause. */
   not_present = (f->error_code & PF_P) == 0;
-  if (not_present) {
-   // Page not present
+  if (!not_present) {
+   // Page present
    EXIT(-1);  
   }
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
-  if (is_kernel_vaddr(fault_addr) || user == 0) {
+  /*if (is_kernel_vaddr(fault_addr) || user == 0) {
    // kernel fault
    EXIT(-1);
-  }
+  }*/
 
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to
      which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
+  /*printf ("Page fault at %p: %s error %s page in %s context.\n",
           fault_addr,
           not_present ? "not present" : "rights violation",
           write ? "writing" : "reading",
           user ? "user" : "kernel");
-  kill (f);
+  kill (f); */
+  
+   struct vm_entry *vme = vm_entry_find(fault_addr);
+   if(vme == NULL){
+
+   if (stack_growth_allowed (fault_addr, f->esp)){
+         vm_grow_stack(fault_addr);
+         return;
+      }
+      else{
+         EXIT(-1);
+      }
+   }
+   if(!vm_resolve_fault(vme)){
+	   EXIT(-1);
+   }
+}
+// Verifica se o endereço de falha justifica o crescimento da pilha
+static bool stack_growth_allowed (void *addr, void *esp)
+{
+   void *page_base = pg_round_down (addr);
+   if (!is_user_vaddr (page_base))
+      return false;
+
+   uint8_t *fault = addr;
+   uint8_t *stack_ptr = esp;
+   uint8_t *limit = (uint8_t *) PHYS_BASE - 0x800000;
+   if (fault < limit)
+      return false;
+   if (fault + 32 < stack_ptr)
+      return false;
+
+   return true;
 }
 

@@ -1,14 +1,17 @@
 #include "userprog/syscall.h"
 #include <stdio.h>
+#include "userprog/process.h"
 #include <syscall-nr.h>
 #include <string.h>
+#include "devices/shutdown.h"
+#include "threads/malloc.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "filesys/filesys.h"
 #include "filesys/file.h"
 
-struct lock lock_file;
+extern struct lock frame_pool_lock;
 #define ARG1 (*(uint32_t *)(f->esp + 4))
 #define ARG2 (*(uint32_t *)(f->esp + 8))
 #define ARG3 (*(uint32_t *)(f->esp + 12))
@@ -19,7 +22,7 @@ static void verify_addr (const void *addr);
 void
 syscall_init (void) 
 {
-  lock_init(&lock_file);
+  lock_init(&filesys_lock);
   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
@@ -42,7 +45,10 @@ syscall_handler (struct intr_frame *f UNUSED)
 
     case SYS_EXEC: {
       verify_addr(f->esp + 4);
-      f->eax = process_execute((const char *)ARG1);
+      char *file_name[128];
+      memcpy(file_name, (const char *)ARG1, strlen((const char *)ARG1)+1);
+      pid_t pid = process_execute(file_name);
+	  f->eax = pid;
       break;
     }
 
@@ -80,7 +86,7 @@ syscall_handler (struct intr_frame *f UNUSED)
       }
       verify_addr(file);
     
-      lock_acquire(&lock_file);
+      lock_acquire(&filesys_lock);
     
       struct file *opened = filesys_open(file);
       int res = -1;
@@ -102,7 +108,7 @@ syscall_handler (struct intr_frame *f UNUSED)
         }
       }
     
-      lock_release(&lock_file);
+      lock_release(&filesys_lock);
       f->eax = res;
       break;
     }
@@ -122,34 +128,10 @@ syscall_handler (struct intr_frame *f UNUSED)
     }
 
     case SYS_READ: {
-      verify_addr(f->esp + 4);
-      int fd = (int)ARG1;
-      void *buffer = (void *)ARG2;
-      unsigned size = (unsigned)ARG3;
-
-      if (!buffer) {
-        EXIT(-1);
-      }
-      if (!thread_current()->FD[fd]) {
-        EXIT(-1);
-      }
-      verify_addr(buffer);
-
-      if (!fd) {
-        lock_acquire(&lock_file);
-        for (int i = 0; i < (int)size; i++) {
-          *((uint8_t *)buffer + i) = input_getc();
-        }
-        lock_release(&lock_file);
-        f->eax = (int)size;
-      } else if (fd > 2) {
-        lock_acquire(&lock_file);
-        int res = file_read(thread_current()->FD[fd], buffer, size);
-        lock_release(&lock_file);
-        f->eax = res;
-      } else {
-        f->eax = -1;
-      }
+      verify_addr (f->esp+4);
+      verify_addr (f->esp+8);
+      verify_addr (f->esp+12);
+      f->eax = read((int)ARG1, (void *)ARG2, (unsigned)ARG3);
       break;
     }
 
@@ -164,17 +146,17 @@ syscall_handler (struct intr_frame *f UNUSED)
       verify_addr(buffer);
 
       if (fd == 1) {
-        lock_acquire(&lock_file);
+        lock_acquire(&filesys_lock);
         putbuf(buffer, size);
-        lock_release(&lock_file);
+        lock_release(&filesys_lock);
         f->eax = (int)size;
       } else if (fd > 2) {
         if (!thread_current()->FD[fd]) {
           EXIT(-1);
         }
-        lock_acquire(&lock_file);
+        lock_acquire(&filesys_lock);
         int res = file_write(thread_current()->FD[fd], buffer, size);
-        lock_release(&lock_file);
+        lock_release(&filesys_lock);
         f->eax = res;
       } else {
         f->eax = -1;
@@ -214,8 +196,20 @@ syscall_handler (struct intr_frame *f UNUSED)
       break;
     }
 
-    default:
-      return;
+    case SYS_MMAP: {
+      verify_addr(f->esp + 4);
+      verify_addr(f->esp + 8);
+      f->eax = mmap((int)ARG1, (void *)ARG2);
+      break;
+    }
+    
+    case SYS_MUNMAP: {
+      verify_addr(f->esp + 4);
+      munmap((int)ARG1);
+      break;
+    }
+	default:
+		return;
   }
 }
 
@@ -235,4 +229,185 @@ static void verify_addr (const void *addr) {
   if (addr == NULL || !is_user_vaddr(addr)) {
     EXIT(-1);
   }
+}
+ 
+int read (int fd, void *buffer, unsigned size)
+{
+  verify_addr (buffer);
+
+  uint8_t *page_base = pg_round_down (buffer);
+  struct thread *cur = thread_current ();
+  int result = -1;
+
+  lock_acquire (&filesys_lock);
+  pin_user_buffer (page_base, size);
+
+  const int fd_limit = 128;
+
+  if (fd == 0)
+    {
+      for (unsigned i = 0; i < size; i++)
+        ((uint8_t *) buffer)[i] = input_getc ();
+      result = (int) size;
+    }
+  else if (fd >= 0 && fd < fd_limit)
+    {
+      struct file *opened = cur->FD[fd];
+      if (opened != NULL)
+        result = file_read (opened, buffer, size);
+    }
+
+  unpin_user_buffer (page_base, size);
+  lock_release (&filesys_lock);
+  return result;
+}
+// Mapeia o arquivo identificado por fd no endereço addr
+int mmap (int fd, void *addr)
+{
+  struct thread *cur = thread_current ();
+
+  if (addr == NULL || pg_ofs (addr) != 0 || fd <= 1)
+    return -1;
+
+  struct file *origin = cur->FD[fd];
+  if (origin == NULL)
+    return -1;
+
+  struct file *file = file_reopen (origin);
+  if (file == NULL)
+    return -1;
+
+  off_t remaining = file_length (file);
+  if (remaining == 0)
+    {
+      lock_acquire (&filesys_lock);
+      file_close (file);
+      lock_release (&filesys_lock);
+      return -1;
+    }
+
+  struct mmap_file *mapping = malloc (sizeof *mapping);
+  if (mapping == NULL)
+    {
+      lock_acquire (&filesys_lock);
+      file_close (file);
+      lock_release (&filesys_lock);
+      return -1;
+    }
+
+  memset (mapping, 0, sizeof *mapping);
+  mapping->file = file;
+  mapping->mapid = cur->next_mapid++;
+  list_init (&mapping->vme_list);
+  list_push_back (&cur->mmap_list, &mapping->elem);
+
+  uint8_t *upage = addr;
+  off_t offset = 0;
+  while (remaining > 0)
+    {
+      size_t to_read = remaining < PGSIZE ? remaining : PGSIZE;
+      size_t to_zero = PGSIZE - to_read;
+
+      if (vm_entry_find (upage) != NULL)
+        {
+          vm_perform_munmap (mapping);
+          return -1;
+        }
+
+      struct vm_entry *entry = malloc (sizeof *entry);
+      if (entry == NULL)
+        {
+          vm_perform_munmap (mapping);
+          return -1;
+        }
+
+      memset (entry, 0, sizeof *entry);
+      entry->virtual_addr = upage;
+      entry->page_type = VM_FILE;
+      entry->file = file;
+      entry->offset = offset;
+      entry->data_size = to_read;
+      entry->zero_size = to_zero;
+      entry->load_flag = 0;
+      entry->can_write = 1;
+
+      vm_entry_insert (&cur->vm, entry);
+      list_push_back (&mapping->vme_list, &entry->elem_mmap);
+
+      remaining -= to_read;
+      offset += to_read;
+      upage += PGSIZE;
+    }
+
+  return mapping->mapid;
+}
+// Desmapeia o mapeamento identificado por mapid
+void munmap (int mapid)
+{
+  struct thread *cur = thread_current ();
+
+  if (list_empty (&cur->mmap_list))
+    return;
+
+  struct list_elem *e = list_begin (&cur->mmap_list);
+  while (e != list_end (&cur->mmap_list))
+    {
+      struct mmap_file *mapping = list_entry (e, struct mmap_file, elem);
+      if (mapping->mapid != mapid)
+        {
+          e = list_next (e);
+          continue;
+        }
+
+      e = vm_perform_munmap (mapping);
+    }
+}
+// Marca as páginas do buffer como presas na memória
+void pin_user_buffer (void *offset, int size)
+{
+  if (size <= 0)
+    return;
+
+  struct thread *cur = thread_current ();
+  uint8_t *start = offset;
+  uint8_t *limit = start + size;
+  // Percorre todas as páginas do buffer
+  for (; start < limit; start += PGSIZE)
+    {
+      struct vm_entry *entry = vm_entry_find (start);
+      if (entry == NULL)
+        continue;
+
+      if (!entry->load_flag)
+        vm_resolve_fault (entry);
+
+      lock_acquire (&frame_pool_lock);
+      void *kaddr = pagedir_get_page (cur->pagedir, start);
+      struct page *frame = frame_lookup (kaddr);
+      frame->pinned = true;
+      lock_release (&frame_pool_lock);
+    }
+}
+// Desmarca as páginas do buffer como presas na memória
+void unpin_user_buffer (void *offset, int size)
+{
+  if (size <= 0)
+    return;
+
+  struct thread *cur = thread_current ();
+  uint8_t *start = offset;
+  uint8_t *limit = start + size;
+  // Percorre todas as páginas do buffer
+  for (; start < limit; start += PGSIZE)
+    {
+      struct vm_entry *entry = vm_entry_find (start);
+      if (entry == NULL || !entry->load_flag)
+        continue;
+
+      lock_acquire (&frame_pool_lock);
+      void *kaddr = pagedir_get_page (cur->pagedir, start);
+      struct page *frame = frame_lookup (kaddr);
+      frame->pinned = false;
+      lock_release (&frame_pool_lock);
+    }
 }

@@ -529,6 +529,10 @@ init_thread (struct thread *t, const char *name, int priority)
     sema_init(&(t->child_lock), 0);
     sema_init(&(t->mem_lock), 0);
 
+    t->parent = running_thread();
+    list_init(&(t->mmap_list));
+    t->next_mapid = 1;
+
     list_init(&t->child_list);
     list_push_back(&(running_thread()->child_list), &(t->child_elem));
   #endif
