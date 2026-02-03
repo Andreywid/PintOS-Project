@@ -5,6 +5,7 @@
 #include "filesys/filesys.h"
 #include "filesys/inode.h"
 #include "threads/malloc.h"
+#include "threads/thread.h"
 
 /* A directory. */
 struct dir 
@@ -26,7 +27,7 @@ struct dir_entry
 bool
 dir_create (block_sector_t sector, size_t entry_cnt)
 {
-  return inode_create (sector, entry_cnt * sizeof (struct dir_entry));
+  return inode_create (sector, entry_cnt * sizeof (struct dir_entry), 1);
 }
 
 /* Opens and returns the directory for the given INODE, of which
@@ -192,6 +193,9 @@ dir_remove (struct dir *dir, const char *name)
   ASSERT (dir != NULL);
   ASSERT (name != NULL);
 
+  if (!(strcmp(name, ".") && strcmp(name, ".."))){
+    return false;
+  }
   /* Find directory entry. */
   if (!lookup (dir, name, &e, &ofs))
     goto done;
@@ -200,6 +204,13 @@ dir_remove (struct dir *dir, const char *name)
   inode = inode_open (e.inode_sector);
   if (inode == NULL)
     goto done;
+
+  struct dir * t_dir = thread_current()->current_dir;
+  struct inode * inode_ = dir_get_inode(t_dir);
+
+  if(inode_ == inode){
+      t_dir = NULL;
+  }
 
   /* Erase directory entry. */
   e.in_use = false;
@@ -228,9 +239,59 @@ dir_readdir (struct dir *dir, char name[NAME_MAX + 1])
       dir->pos += sizeof e;
       if (e.in_use)
         {
-          strlcpy (name, e.name, NAME_MAX + 1);
-          return true;
+          if (strcmp(e.name, ".") && strcmp(e.name, "..")){
+            strlcpy (name, e.name, NAME_MAX + 1);
+            return true;
+          }
         } 
     }
   return false;
+}
+
+// Verifica se o diretório não contém entradas além de "." e "..".
+bool dir_is_empty (struct dir *dir){
+  struct dir_entry entry;
+  off_t offset = 0;
+
+  while (inode_read_at (dir->inode, &entry, sizeof entry, offset) == sizeof entry)
+    {
+      offset += sizeof entry;
+
+      if (entry.in_use && strcmp (entry.name, ".") && strcmp (entry.name, ".."))
+        return false;
+    }
+
+  return true;
+}
+
+// Lê a próxima entrada de diretório usando posição externa (pos) em vez de dir->pos.
+bool dir_readdir_at (struct inode *inode, off_t *pos, char name[NAME_MAX + 1]){
+  struct dir_entry entry;
+
+  if (inode == NULL || pos == NULL){
+    return false;
+  }
+
+  while (inode_read_at (inode, &entry, sizeof entry, *pos) == sizeof entry){
+    *pos += sizeof entry;
+
+    if (entry.in_use
+        && strcmp (entry.name, ".")
+        && strcmp (entry.name, ".."))
+      {
+        strlcpy (name, entry.name, NAME_MAX + 1);
+        return true;
+      }
+  }
+
+  return false;
+}
+
+// Inicializa um diretório filho com as entradas especiais "." e "..".
+void dir_init (struct dir *parent_dir, struct dir *child_dir){
+  block_sector_t parent_sector = inode_get_inumber (dir_get_inode (parent_dir));
+  block_sector_t child_sector  = inode_get_inumber (dir_get_inode (child_dir));
+
+  dir_add (child_dir, ".", child_sector);
+  dir_add (child_dir, "..", parent_sector);
 }

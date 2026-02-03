@@ -125,7 +125,7 @@ struct thread
     struct list mmap_list;
     int next_mapid;
 #endif
-
+    struct dir *current_dir; 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
   };

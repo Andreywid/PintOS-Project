@@ -19,6 +19,7 @@
 #include "threads/vaddr.h"
 #include "userprog/syscall.h"
 #include "vm/swap.h"
+#include "lib/user/syscall.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -174,6 +175,7 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+  dir_close (cur->current_dir);
 
   struct list_elem * e;
 
@@ -654,11 +656,15 @@ struct list_elem *vm_perform_munmap(struct mmap_file * mmap_file){
     struct list_elem *next = list_next(elem);
     // Se a página foi carregada na memória
     if (vme->load_flag){
-      if (pagedir_is_dirty(pagedir, vme->virtual_addr)){
-        file_write_at(vme->file, vme->virtual_addr, vme->data_size, vme->offset);
-      }
       void *kaddr = pagedir_get_page(pagedir, vme->virtual_addr);
-      frame_free_by_kaddr(kaddr);
+      if (pagedir_is_dirty(pagedir, vme->virtual_addr) && kaddr != NULL)
+        {
+          lock_acquire (&filesys_lock);
+          file_write_at(vme->file, kaddr, vme->data_size, vme->offset);
+          lock_release (&filesys_lock);
+        }
+      if (kaddr != NULL)
+        frame_free_by_kaddr(kaddr);
       // Remove o mapeamento da tabela de páginas
       pagedir_clear_page(pagedir, vme->virtual_addr);
     }

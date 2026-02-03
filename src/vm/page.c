@@ -14,6 +14,7 @@
 
 static unsigned vm_entry_hash (const struct hash_elem *, void *aux);
 static bool vm_entry_less (const struct hash_elem *, const struct hash_elem *, void *aux);
+static struct page *frame_find_clock_victim (void);
 
 extern struct lock filesys_lock;
 
@@ -183,19 +184,7 @@ struct list_elem *frame_clock_next (void){
 
 // Seleciona e desaloca uma vítima
 void frame_select_victim (void){
-	frame_clock_cursor = frame_clock_next ();
-	ASSERT (frame_clock_cursor != NULL);
-	struct page *page = list_entry (frame_clock_cursor, struct page, frame);
-
-	for (;;){
-		if (page->vme->virtual_addr <= PHYS_BASE){
-			if (!pagedir_is_accessed (page->thread->pagedir, page->vme->virtual_addr))
-				break;
-			pagedir_set_accessed (page->thread->pagedir, page->vme->virtual_addr, false);
-		}
-		frame_clock_cursor = frame_clock_next ();
-		page = list_entry (frame_clock_cursor, struct page, frame);
-	}
+	struct page *page = frame_find_clock_victim ();
 
 	switch (page->vme->page_type){
 	case VM_BIN:
@@ -206,8 +195,12 @@ void frame_select_victim (void){
 		break;
 	case VM_FILE:
 		if (pagedir_is_dirty (page->thread->pagedir, page->vme->virtual_addr))
-			file_write_at (page->vme->file, page->vme->virtual_addr,
-			              page->vme->data_size, page->vme->offset);
+			{
+				lock_acquire (&filesys_lock);
+				file_write_at (page->vme->file, page->kaddr,
+				              page->vme->data_size, page->vme->offset);
+				lock_release (&filesys_lock);
+			}
 		break;
 	case VM_ANON:
 		page->vme->swap_slot = swap_store_page (page->kaddr);
@@ -216,6 +209,39 @@ void frame_select_victim (void){
 	page->vme->load_flag = false;
 
 	frame_release (page);
+}
+// Encontra uma vítima usando o algoritmo de Clock
+static struct page *frame_find_clock_victim (void){
+	ASSERT (!list_empty (&frame_pool));
+
+	size_t scanned = 0;
+	size_t total = list_size (&frame_pool);
+
+	while (true){
+		frame_clock_cursor = frame_clock_next ();
+		ASSERT (frame_clock_cursor != NULL);
+		struct page *candidate = list_entry (frame_clock_cursor, struct page, frame);
+
+		if (candidate->pinned){
+			if (++scanned >= total){
+				frame_clock_cursor = NULL;
+				lock_release (&frame_pool_lock);
+				thread_yield ();
+				lock_acquire (&frame_pool_lock);
+				total = list_size (&frame_pool);
+				scanned = 0;
+			}
+			continue;
+		}
+
+		scanned = 0;
+
+		if (candidate->vme->virtual_addr <= PHYS_BASE){
+			if (!pagedir_is_accessed (candidate->thread->pagedir, candidate->vme->virtual_addr))
+				return candidate;
+			pagedir_set_accessed (candidate->thread->pagedir, candidate->vme->virtual_addr, false);
+		}
+	}
 }
 
 // Procura um frame pelo endereço kernel

@@ -10,14 +10,22 @@
 #include "threads/vaddr.h"
 #include "filesys/filesys.h"
 #include "filesys/file.h"
+#include "threads/synch.h"
+#include "filesys/inode.h"
+#include "filesys/directory.h"
+#include "devices/input.h"
+#include "userprog/pagedir.h"
 
 extern struct lock frame_pool_lock;
+struct lock filesys_lock; // Lock para operações do sistema de arquivos
 #define ARG1 (*(uint32_t *)(f->esp + 4))
 #define ARG2 (*(uint32_t *)(f->esp + 8))
 #define ARG3 (*(uint32_t *)(f->esp + 12))
 
 static void syscall_handler (struct intr_frame *);
 static void verify_addr (const void *addr);
+void pin_user_buffer (void *offset, int size, bool for_write);
+void unpin_user_buffer (void *offset, int size);
 
 void
 syscall_init (void) 
@@ -45,7 +53,7 @@ syscall_handler (struct intr_frame *f UNUSED)
 
     case SYS_EXEC: {
       verify_addr(f->esp + 4);
-      char *file_name[128];
+      char file_name[128];
       memcpy(file_name, (const char *)ARG1, strlen((const char *)ARG1)+1);
       pid_t pid = process_execute(file_name);
 	  f->eax = pid;
@@ -144,6 +152,8 @@ syscall_handler (struct intr_frame *f UNUSED)
         EXIT(-1);
       }
       verify_addr(buffer);
+      void *page_base = pg_round_down ((void *)buffer);
+      pin_user_buffer (page_base, size, false);
 
       if (fd == 1) {
         lock_acquire(&filesys_lock);
@@ -161,6 +171,7 @@ syscall_handler (struct intr_frame *f UNUSED)
       } else {
         f->eax = -1;
       }
+      unpin_user_buffer (page_base, size);
       break;
     }
 
@@ -208,6 +219,38 @@ syscall_handler (struct intr_frame *f UNUSED)
       munmap((int)ARG1);
       break;
     }
+    	
+    case SYS_ISDIR: {
+      verify_addr (f->esp+4);
+      f->eax = isdir((int)ARG1);
+      break;
+    }
+
+    case SYS_CHDIR: {
+      verify_addr(f->esp+4);
+      f->eax = chdir((const char *)ARG1);
+      break;
+    }
+
+    case SYS_MKDIR: {
+      verify_addr(f->esp+4);
+      f->eax = mkdir((const char *)ARG1);
+      break;
+    }
+
+    case SYS_READDIR: {
+      verify_addr(f->esp+4);
+      verify_addr(f->esp+8);
+      f->eax = readdir((int)ARG1, (char*)ARG2);
+      break;
+    }
+
+    case SYS_INUMBER: {
+      verify_addr(f->esp+4);
+      f->eax = inumber((int)ARG1);
+      break;	
+    }
+
 	default:
 		return;
   }
@@ -239,8 +282,8 @@ int read (int fd, void *buffer, unsigned size)
   struct thread *cur = thread_current ();
   int result = -1;
 
+  pin_user_buffer (page_base, size, true);
   lock_acquire (&filesys_lock);
-  pin_user_buffer (page_base, size);
 
   const int fd_limit = 128;
 
@@ -257,8 +300,8 @@ int read (int fd, void *buffer, unsigned size)
         result = file_read (opened, buffer, size);
     }
 
-  unpin_user_buffer (page_base, size);
   lock_release (&filesys_lock);
+  unpin_user_buffer (page_base, size);
   return result;
 }
 // Mapeia o arquivo identificado por fd no endereço addr
@@ -363,7 +406,7 @@ void munmap (int mapid)
     }
 }
 // Marca as páginas do buffer como presas na memória
-void pin_user_buffer (void *offset, int size)
+void pin_user_buffer (void *offset, int size, bool for_write)
 {
   if (size <= 0)
     return;
@@ -376,13 +419,36 @@ void pin_user_buffer (void *offset, int size)
     {
       struct vm_entry *entry = vm_entry_find (start);
       if (entry == NULL)
+      {
+        // Sem vm_entry: deve haver página mapeada presente
+        void *kaddr0 = pagedir_get_page (cur->pagedir, start);
+        if (kaddr0 == NULL)
+          EXIT (-1);
+        if (for_write && !pagedir_is_writable (cur->pagedir, start))
+          EXIT (-1);
+        // Página já residente: marque como pinned
+        lock_acquire (&frame_pool_lock);
+        struct page *frame0 = frame_lookup (kaddr0);
+        if (frame0){
+          frame0->pinned = true;
+        }
+        lock_release (&frame_pool_lock);
         continue;
-
-      if (!entry->load_flag)
-        vm_resolve_fault (entry);
+      }
+      if (for_write && !entry->can_write){
+        EXIT (-1);
+      }
+      if (!entry->load_flag && !vm_resolve_fault (entry))
+      {
+        EXIT (-1);
+      }
 
       lock_acquire (&frame_pool_lock);
       void *kaddr = pagedir_get_page (cur->pagedir, start);
+      if (kaddr == NULL) {
+        lock_release (&frame_pool_lock);
+        EXIT (-1);
+      }
       struct page *frame = frame_lookup (kaddr);
       frame->pinned = true;
       lock_release (&frame_pool_lock);
@@ -401,13 +467,94 @@ void unpin_user_buffer (void *offset, int size)
   for (; start < limit; start += PGSIZE)
     {
       struct vm_entry *entry = vm_entry_find (start);
-      if (entry == NULL || !entry->load_flag)
+      if (entry == NULL) {
+        void *kaddr0 = pagedir_get_page (cur->pagedir, start);
+        if (kaddr0 == NULL){
+          continue;
+        }
+        lock_acquire (&frame_pool_lock);
+        struct page *frame0 = frame_lookup (kaddr0);
+        if (frame0){
+          frame0->pinned = false;
+        }
+        lock_release (&frame_pool_lock);
         continue;
+      }
+      if (!entry->load_flag){
+        continue;
+      }
 
       lock_acquire (&frame_pool_lock);
       void *kaddr = pagedir_get_page (cur->pagedir, start);
-      struct page *frame = frame_lookup (kaddr);
-      frame->pinned = false;
+      if (kaddr){
+          struct page *frame = frame_lookup (kaddr);
+          if (frame){
+            frame->pinned = false;
+          }
+      }
       lock_release (&frame_pool_lock);
     }
+}
+
+// Verifica se o descritor de arquivo fd é um diretório
+bool isdir (int fd)
+{
+	struct file *file;
+  struct inode *inode;
+	bool isdir;
+  
+  	file = thread_current()->FD[fd];
+  	if (file == NULL)
+    	EXIT (-1);
+
+  	inode = file_get_inode (file);
+  	isdir = inode_is_dir (inode);
+  	return isdir;
+}
+
+// Muda o diretório atual para o especificado em path_o
+bool chdir (const char *path_o)
+{
+  if (path_o == NULL)
+    return false;
+  return filesys_change_dir(path_o);
+}
+
+// Cria um novo diretório no caminho especificado
+bool mkdir(const char *dir){
+	return filesys_create_dir(dir);
+}
+
+bool readdir(int fd, char name[READDIR_MAX_LEN + 1]){
+  // Lê entradas de diretório preservando a posição via file->pos
+  struct file *file = thread_current()->FD[fd];
+  if (file == NULL)
+    EXIT (-1);
+
+  struct inode *inode = file_get_inode(file);
+  if (!inode_is_dir(inode))
+    return false;
+
+  // Usa a posição de arquivo para acompanhar o progresso no diretório
+  off_t pos = file_tell(file);
+  bool ok = dir_readdir_at(inode, &pos, name);
+  if (ok)
+    file_seek(file, pos);
+  return ok;
+}
+
+// Retorna o número do inode do arquivo associado ao descritor de arquivo fd
+int inumber(int fd){
+
+	struct file *file;
+  	struct inode *inode;
+  
+    file = thread_current()->FD[fd];
+    if (file == NULL)
+      	EXIT (-1);
+
+  	inode = file_get_inode (file);
+
+   	int inum = inode_get_inumber(inode);
+   	return inum;
 }
