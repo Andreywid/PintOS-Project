@@ -53,6 +53,10 @@ operations are not supported in kernel mode.
 The scheduler was designed to remain deterministic and compliant with all
 official timing-based tests.
 
+### Contributors
+- Andreywid Souza ([@Andreywid](https://github.com/Andreywid))
+- Luiz Gustavo ([@lzgustavo13](https://github.com/lzgustavo13))
+
 ---
 
 ## Project 2 – User Programs
@@ -77,6 +81,11 @@ is serialized using a global lock to ensure correctness under concurrency.
 
 Parent–child synchronization is implemented via semaphores to guarantee
 correct load reporting and exit status propagation.
+
+### Contributors
+- Andreywid Souza ([@Andreywid](https://github.com/Andreywid))
+- Luiz Gustavo ([@lzgustavo13](https://github.com/lzgustavo13))
+- Artur Vinicius Pereira Fernandes ([@Arturvpf](https://github.com/Arturvpf))
 
 ---
 
@@ -109,6 +118,11 @@ loading from swap, stack growth, or process termination.
 Special care was taken to avoid deadlocks between the VM subsystem and
 the file system during page-in and page-out operations.
 
+### Contributors
+- Andreywid Souza ([@Andreywid](https://github.com/Andreywid))
+- Luiz Gustavo ([@lzgustavo13](https://github.com/lzgustavo13))
+- Artur Vinicius Pereira Fernandes ([@Arturvpf](https://github.com/Arturvpf))
+
 ---
 
 ## Project 4 – File System
@@ -135,6 +149,11 @@ reduces disk traffic while preserving consistency.
 
 Synchronization was carefully designed to avoid race conditions between
 cache eviction, inode updates, and concurrent directory operations.
+
+### Contributors
+- Andreywid Souza ([@Andreywid](https://github.com/Andreywid))
+- Luiz Gustavo ([@lzgustavo13](https://github.com/lzgustavo13))
+- Artur Vinicius Pereira Fernandes ([@Arturvpf](https://github.com/Arturvpf))
 
 ---
 
